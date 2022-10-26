@@ -1,4 +1,4 @@
-import IncompressibleTorusFluidDemo from '../components/IncompressibleTorusFluidDemo';
+import CoriolisTorusFluidDemo from '../components/CoriolisTorusFluidDemo';
 
 function Error() {
   return (
@@ -6,7 +6,7 @@ function Error() {
       display: "flex",
       height: "100vh",
     }}>
-      <IncompressibleTorusFluidDemo
+      <CoriolisTorusFluidDemo
         className="mx-auto"
         xsize={400}
         ysize={400}
