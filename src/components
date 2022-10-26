@@ -282,7 +282,7 @@ float arrow(vec2 p, vec2 v) {
     
     // We can't draw arrows larger than the tile radius, so clamp magnitude.
     // Enforce a minimum length to help see direction
-    mag_v = clamp(mag_v, 5.0, ARROW_TILE_SIZE * 0.5);
+    mag_v = clamp(mag_v, 5.0, ARROW_TILE_SIZE * 0.5)*2.0;
 
     // Arrow tip location
     v = dir_v * mag_v;
@@ -329,7 +329,7 @@ void main() {
   float scalar_val = clamp(texture(u_scalar_tex, v_texCoord).x + u_offset, 0.0, 1.0);
   vec4 field_col = vec4(inferno(scalar_val), 1.0);
 
-  outColor = mix(arrow_col, field_col, arrow_col.a);
+  outColor = vec4(mix(arrow_col.rgb, field_col.rgb, arrow_col.a), 1);
 }
 `
 
@@ -377,6 +377,79 @@ void main() {
 }
 `
 
+const coriolis_fs = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+#define PI 3.1415926538
+
+// the velocity texture
+uniform sampler2D u_vel_tex;
+
+// the texCoords passed in from the vertex shader.
+in vec2 v_texCoord;
+
+// the output
+out vec4 value;
+
+void main() {
+  float phi = (v_texCoord.y + 0.5)*2.0*PI;
+
+  // express the rotation vector in terms of local coordinates
+  vec3 omega = vec3(
+      0,
+      cos(phi),
+      sin(phi)
+   );
+
+  vec2 src = texture(u_vel_tex, v_texCoord).xy;
+
+  // express the wind direction in terms of local coordinates
+  vec3 v = vec3(src, 0);
+
+  vec2 acc = cross(omega, v).xy;
+
+  vec2 ret = src;
+
+  // rescale so we don't get infinite energy
+  if(length(acc) > 0.0) {
+    ret = src; //0.05*acc;
+  }
+
+  value = vec4(ret, 0, 0);
+}
+`
+
+const thermal_fs = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+#define PI 3.1415926538
+
+// the thermal texture
+uniform sampler2D u_scalar_tex;
+
+// the texCoords passed in from the vertex shader.
+in vec2 v_texCoord;
+
+// the output
+out vec4 value;
+
+void main() {
+  const float dissipation_rate = 0.999;
+
+  float phi = (v_texCoord.y + 0.5)*2.0*PI;
+  float xComponentNormal = cos(phi);
+  float added_load = 0.0;
+  if(xComponentNormal > 0.0) {
+      added_load = 0.001*cos(phi);
+  }
+
+  value = texture(u_scalar_tex, v_texCoord)*dissipation_rate + vec4(added_load, 0, 0, 0);
+  //value = texture(u_scalar_tex, v_texCoord);
+}
+`
+
 
 const torus_vs = `#version 300 es
 #define PI 3.1415926538
@@ -395,8 +468,8 @@ uniform mat4 u_worldViewProjection;
 
 
 void main() {
-   float theta = (a_position.x * u_minorAlpha + 0.5) * 2.0 * PI;
-   float phi = a_position.y * u_majorAlpha * 2.0 * PI;
+   float theta = (a_position.y * u_minorAlpha + 0.5) * 2.0 * PI;
+   float phi = a_position.x * u_majorAlpha * 2.0 * PI;
 
    v_texCoord = a_position;
 
@@ -427,7 +500,7 @@ out vec4 v_outColor;
 void main() {
   // color: 0xEBDBB2,
   // v_outColor = vec4(0.922,0.859,0.698, 1.0);
-  v_outColor = texture(u_render_tex, v_texCoord.yx);
+  v_outColor = texture(u_render_tex, v_texCoord);
 }
 `;
 
@@ -482,6 +555,10 @@ class IncompressibleTorusFluidDemo extends React.Component<IncompressibleTorusFl
   private prog_apply_pressure_force!: WebGLProgram;
   private prog_render!: WebGLProgram;
   private prog_paint_vel!: WebGLProgram;
+
+  // environmental
+  private prog_thermal!: WebGLProgram;
+  private prog_coriolis!: WebGLProgram;
 
   // The index of the scalar texture we're using as a source
   private scalarIndex = 0;
@@ -867,6 +944,72 @@ class IncompressibleTorusFluidDemo extends React.Component<IncompressibleTorusFl
       this.gl.uniform1i(velTexLoc, 1);
     }
 
+    // build the thermal program
+    {
+      // create program
+      this.prog_thermal = createProgram(
+        this.gl,
+        [
+          createShader(this.gl, this.gl.VERTEX_SHADER, vs),
+          createShader(this.gl, this.gl.FRAGMENT_SHADER, thermal_fs),
+        ]
+      )!;
+
+      const positionLoc = this.gl.getAttribLocation(this.prog_thermal, 'c_position');
+      const scalarTexLoc = this.gl.getUniformLocation(this.prog_thermal, 'u_scalar_tex');
+
+      // setup our attributes to tell WebGL how to pull
+      // the data from the buffer above to the position attribute
+      this.gl.enableVertexAttribArray(positionLoc);
+      this.gl.vertexAttribPointer(
+        positionLoc,
+        2,         // size (num components)
+        this.gl.FLOAT,  // type of data in buffer
+        false,     // normalize
+        0,         // stride (0 = auto)
+        0,         // offset
+      );
+
+      // bind uniforms
+      this.gl.useProgram(this.prog_thermal);
+
+      // Tell the shader to get the scalar texture from texture unit 1
+      this.gl.uniform1i(scalarTexLoc , 0);
+    }
+
+    // build the coriolis program
+    {
+      // create program
+      this.prog_coriolis = createProgram(
+        this.gl,
+        [
+          createShader(this.gl, this.gl.VERTEX_SHADER, vs),
+          createShader(this.gl, this.gl.FRAGMENT_SHADER, coriolis_fs),
+        ]
+      )!;
+
+      const positionLoc = this.gl.getAttribLocation(this.prog_coriolis, 'c_position');
+      const velTexLoc = this.gl.getUniformLocation(this.prog_coriolis, 'u_vel_tex');
+
+      // setup our attributes to tell WebGL how to pull
+      // the data from the buffer above to the position attribute
+      this.gl.enableVertexAttribArray(positionLoc);
+      this.gl.vertexAttribPointer(
+        positionLoc,
+        2,         // size (num components)
+        this.gl.FLOAT,  // type of data in buffer
+        false,     // normalize
+        0,         // stride (0 = auto)
+        0,         // offset
+      );
+
+      // bind uniforms
+      this.gl.useProgram(this.prog_coriolis);
+
+      // Tell the shader to get the vel texture from texture unit 1
+      this.gl.uniform1i(velTexLoc , 1);
+    }
+
     {
       // init camera
       this.camera = new TrackballCamera(this.torusCanvas.current!, {});
@@ -929,7 +1072,7 @@ class IncompressibleTorusFluidDemo extends React.Component<IncompressibleTorusFl
     this.minorRange.current!.addEventListener('input', this.handleCircularityChange);
     this.lerpRange.current!.addEventListener('input', this.handleCircularityChange);
 
-    // add mouse tracker
+    // begin monitoring mouse location
     this.cmt = new CanvasMouseTracker(this.canvas.current!);
 
     // start animation loop
@@ -959,17 +1102,6 @@ class IncompressibleTorusFluidDemo extends React.Component<IncompressibleTorusFl
     this.torusGl.uniform1f(this.torusLerpAlpha, lerpAlpha);
   }
 
-  getMousePos(canvas: HTMLCanvasElement, evt: MouseEvent) {
-    const rect = canvas.getBoundingClientRect(); // abs. size of element
-    const scaleX = canvas.width / rect.width;    // relationship bitmap vs. element for X
-    const scaleY = canvas.height / rect.height;  // relationship bitmap vs. element for Y
-
-    return {
-      x: (evt.clientX - rect.left) * scaleX,   // scale mouse coordinates after they have
-      y: (evt.clientY - rect.top) * scaleY     // been adjusted to be relative to element
-    }
-  }
-
   componentWillUnmount() {
     // clean up mouse tracker
     this.cmt.cleanup();
@@ -982,6 +1114,9 @@ class IncompressibleTorusFluidDemo extends React.Component<IncompressibleTorusFl
 
     // stop animation loop
     window.cancelAnimationFrame(this.requestID!);
+    // destroy webgl
+    this.gl.getExtension('WEBGL_lose_context')!.loseContext();
+    this.torusGl.getExtension('WEBGL_lose_context')!.loseContext();
 
     this.camera.cleanup();
   }
@@ -1068,7 +1203,44 @@ class IncompressibleTorusFluidDemo extends React.Component<IncompressibleTorusFl
       this.needsVelocityReset = false;
     }
 
+
     for (let i = 0; i < this.range.current!.valueAsNumber; i++) {
+
+      // do thermal
+      {
+        this.gl.useProgram(this.prog_thermal);
+
+        // make tex the texture to read from at texture0
+        this.gl.activeTexture(this.gl.TEXTURE0);
+        this.gl.bindTexture(this.gl.TEXTURE_2D, this.scalarTextures[this.scalarIndex]);
+
+        // make fbo corresponding to the next texture the current framebuffer
+        this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.scalarFramebuffers[(this.scalarIndex + 1) % 2]);
+
+        // execute draw to the next framebuffer
+        this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
+        // swap source and dest for the next frame
+        this.scalarIndex = (this.scalarIndex + 1) % 2;
+      }
+
+      // do coriolis
+      {
+        this.gl.useProgram(this.prog_coriolis);
+
+        // bind the source velocity texture to texture unit 1
+        this.gl.activeTexture(this.gl.TEXTURE1);
+        this.gl.bindTexture(this.gl.TEXTURE_2D, this.velTextures[this.velIndex]);
+
+        // set the framebuffer to draw at the other velocity texture
+        this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.velFramebuffers[(this.velIndex + 1) % 2]);
+
+        // execute program, doing paint
+        this.gl.drawArrays(this.gl.TRIANGLES, 0, 6);
+
+        // swap source and dest for the next frame
+        this.velIndex = (this.velIndex + 1) % 2;
+      }
+
       // we will advect scalar now
       {
         this.gl.useProgram(this.prog_advect_scalar);
@@ -1207,8 +1379,6 @@ class IncompressibleTorusFluidDemo extends React.Component<IncompressibleTorusFl
       // draw triangles
       this.torusGl.drawArrays(this.torusGl.TRIANGLES, 0, torusVertexes.length);
     }
-
-
   }
 
   render() {
